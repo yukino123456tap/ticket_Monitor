@@ -31,11 +31,6 @@ python main.py 72743 -w -i 10
   - 🟡 **库存变化** — 显示 `+N` 或 `-N`
 - 按 `Ctrl+C` 退出监控
 
-## 获取 Cookie
-
-1. 浏览器打开 [show.bilibili.com](https://show.bilibili.com) 并登录
-2. `F12` → `Application` → `Cookies` → 复制 `SESSDATA` 和 `bili_jct`
-
 ## 获取项目 ID
 
 在 B站会员购活动详情页 URL 中：
