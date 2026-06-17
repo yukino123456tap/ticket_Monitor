@@ -8,17 +8,13 @@
 # 1. 安装
 pip install -r requirements.txt
 
-# 2. 配置 Cookie
-cp .env.example .env
-# 编辑 .env，填入 BILI_SESSDATA 和 BILI_BILI_JCT
-
-# 3. 一次性查询
+# 2. 一次性查询
 python main.py 72743
 
-# 4. 实时监控（每 30s 自动刷新）
+# 3. 实时监控（每 30s 自动刷新）
 python main.py 72743 -w
 
-# 5. 自定义刷新间隔（每 10s）
+# 4. 自定义刷新间隔（每 10s）
 python main.py 72743 -w -i 10
 ```
 
