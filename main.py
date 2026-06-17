@@ -22,6 +22,41 @@ HEADERS = {
     "Cookie": f"SESSDATA={os.getenv('BILI_SESSDATA','')}; bili_jct={os.getenv('BILI_BILI_JCT','')}",
 }
 
+# ---------- 工具 ----------
+
+def is_ticket_sold(t: dict) -> bool:
+    """
+    综合判断票档是否已售罄/不可购。
+    用多个字段交叉验证，避免 API 单字段未更新导致误报"有票"。
+    """
+    # 1) sale_flag.display_name 明确写"已售罄"
+    sale_flag = t.get("sale_flag") or {}
+    if isinstance(sale_flag, dict) and "已售罄" in sale_flag.get("display_name", ""):
+        return True
+
+    # 2) 明确标记售罄
+    if t.get("is_sold_out", False):
+        return True
+
+    # 3) sale_status >= 2 通常表示不可购（2=售罄/下架，3+ 或其他结束态）
+    if isinstance(t.get("sale_status"), int) and t["sale_status"] >= 2:
+        return True
+
+    # 4) sale_flag.number 为 4 通常表示已售罄
+    if isinstance(sale_flag, dict) and sale_flag.get("number") == 4:
+        return True
+
+    # 5) 库存为 0（num / stock 字段，兜底）
+    num = t.get("num")
+    if num is not None and num <= 0:
+        return True
+    stock = t.get("stock")
+    if stock is not None and stock <= 0:
+        return True
+
+    return False
+
+
 # ---------- 核心 API ----------
 
 def get_project(project_id: int) -> dict | None:
@@ -55,9 +90,10 @@ def extract_ticket_snapshot(data: dict) -> dict:
             snapshot[key] = {
                 "desc":       t.get("desc", "?"),
                 "price":      t.get("price", 0),
+                "num":        t.get("num") if t.get("num_type") == 1 else None,
                 "stock":      t.get("stock"),
                 "total":      t.get("total"),
-                "is_sold":    t.get("is_sold_out", False) or t.get("sale_status") == 2,
+                "is_sold":    is_ticket_sold(t),
                 "buy_limit":  t.get("buy_limit", ""),
             }
     return snapshot
@@ -110,20 +146,28 @@ def render_output(data: dict, project_id: int, last_update: str,
             key = (screen_name, ticket_id)
             desc = t.get("desc", "?")
             price = t.get("price", 0)
-            is_sold = t.get("is_sold_out", False) or t.get("sale_status") == 2
+            is_sold = is_ticket_sold(t)
             stock = t.get("stock")
+            num = t.get("num")
+            num_type = t.get("num_type")        # 0=限购值, 1=真实库存
             total = t.get("total")
             buy_limit = t.get("buy_limit", "")
+            static_limit = t.get("static_limit") or {}
 
             status_icon = "❌ 售罄" if is_sold else "✅ 有票"
             price_str = f"¥{price/100:.0f}" if price else "?"
             extra = ""
-            if stock is not None:
+            # num_type==1 时 num 才是真实库存，否则不显示
+            if num is not None and num_type == 1:
+                extra += f" | 剩余: {num}"
+            elif stock is not None:
                 extra += f" | 剩余: {stock}"
             if total is not None:
                 extra += f"/{total}"
-            if buy_limit:
-                extra += f" | 限购: {buy_limit}张"
+            # 限购优先取 static_limit.num，兜底取 buy_limit
+            limit = static_limit.get("num") or buy_limit
+            if limit:
+                extra += f" | 限购: {limit}张"
 
             line = f"    [{ticket_id}] {status_icon} | {price_str} | {desc}{extra}"
 
@@ -132,14 +176,15 @@ def render_output(data: dict, project_id: int, last_update: str,
                 # 如果是售罄→有票，用绿色；有票→售罄，用红色；库存变化用黄色
                 prev = prev_snapshot.get(key, {}) if prev_snapshot else {}
                 prev_sold = prev.get("is_sold", None)
-                prev_stock = prev.get("stock")
+                prev_stock = prev.get("num") if prev.get("num") is not None else prev.get("stock")
+                cur_stock = num if num is not None else stock
 
                 if prev_sold is True and not is_sold:
                     line += "  \033[1;32m⬆ 已补票！\033[0m"
                 elif prev_sold is False and is_sold:
                     line += "  \033[1;31m⬇ 已售罄\033[0m"
-                elif prev_stock is not None and stock is not None and prev_stock != stock:
-                    delta = stock - prev_stock
+                elif prev_stock is not None and cur_stock is not None and prev_stock != cur_stock:
+                    delta = cur_stock - prev_stock
                     sign = "+" if delta > 0 else ""
                     color = "32" if delta > 0 else "31"
                     line += f"  \033[1;{color}m({sign}{delta})\033[0m"
@@ -185,6 +230,7 @@ def watch(project_id: int, interval: int):
                 new = current.get(k, {})
                 if (
                     old.get("is_sold") != new.get("is_sold") or
+                    old.get("num") != new.get("num") or
                     old.get("stock") != new.get("stock") or
                     old.get("total") != new.get("total")
                 ):
@@ -218,6 +264,8 @@ def main():
     parser.add_argument("-w", "--watch", action="store_true", help="持续监控模式")
     parser.add_argument("-i", "--interval", type=int, default=30,
                         help="监控间隔（秒），默认 30，最小 5")
+    parser.add_argument("-d", "--dump", action="store_true",
+                        help="调试模式：打印每张票的原始 API 字段")
 
     args = parser.parse_args()
 
@@ -230,6 +278,21 @@ def main():
 
     project_id = int(pid)
     interval = max(5, args.interval)
+
+    if args.dump:
+        # 调试模式：打印每张票的原始 JSON 字段
+        data = get_project(project_id)
+        if not data:
+            print("获取项目信息失败，请检查项目 ID 或 Cookie")
+            return
+        import json as _json
+        screens = data.get("screen_list") or []
+        for screen in screens:
+            print(f"\n--- 场次: {screen.get('name', '?')} ---")
+            for t in screen.get("ticket_list") or []:
+                print(f"\n  [{t.get('id','?')}] {t.get('desc','?')} ¥{t.get('price',0)/100:.0f}")
+                print(f"  {_json.dumps(t, ensure_ascii=False, indent=4)}")
+        return
 
     if args.watch:
         print(f"🔍 开始监控项目 {project_id}，每 {interval}s 刷新一次...")
