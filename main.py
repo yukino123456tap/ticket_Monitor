@@ -27,29 +27,34 @@ HEADERS = {
 def is_ticket_sold(t: dict) -> bool:
     """
     综合判断票档是否已售罄/不可购。
-    用多个字段交叉验证，避免 API 单字段未更新导致误报"有票"。
+    sale_flag.number 含义：1=未开售, 2=预售中/在售, 4=已售罄
+    num_type: 0=限购值(非库存), 1=真实库存
     """
-    # 1) sale_flag.display_name 明确写"已售罄"
     sale_flag = t.get("sale_flag") or {}
-    if isinstance(sale_flag, dict) and "已售罄" in sale_flag.get("display_name", ""):
-        return True
+    flag_num = sale_flag.get("number") if isinstance(sale_flag, dict) else None
+    flag_name = sale_flag.get("display_name", "") if isinstance(sale_flag, dict) else ""
+
+    # 1) 未开售 → 不是售罄
+    if flag_num == 1 or "未开售" in flag_name:
+        return False
 
     # 2) 明确标记售罄
+    if flag_num == 4 or "已售罄" in flag_name:
+        return True
+
+    # 3) 其他明确的售罄标记
     if t.get("is_sold_out", False):
         return True
 
-    # 3) sale_status >= 2 通常表示不可购（2=售罄/下架，3+ 或其他结束态）
+    # 4) sale_status >= 2 通常表示不可购（2=售罄/下架，3+ 或其他结束态）
     if isinstance(t.get("sale_status"), int) and t["sale_status"] >= 2:
         return True
 
-    # 4) sale_flag.number 为 4 通常表示已售罄
-    if isinstance(sale_flag, dict) and sale_flag.get("number") == 4:
-        return True
-
-    # 5) 库存为 0（num / stock 字段，兜底）
-    num = t.get("num")
-    if num is not None and num <= 0:
-        return True
+    # 5) 库存为 0（只当 num_type==1 时 num 才是真实库存）
+    if t.get("num_type") == 1:
+        num = t.get("num")
+        if num is not None and num <= 0:
+            return True
     stock = t.get("stock")
     if stock is not None and stock <= 0:
         return True
@@ -153,8 +158,15 @@ def render_output(data: dict, project_id: int, last_update: str,
             total = t.get("total")
             buy_limit = t.get("buy_limit", "")
             static_limit = t.get("static_limit") or {}
+            sale_flag = t.get("sale_flag") or {}
+            flag_name = sale_flag.get("display_name", "") if isinstance(sale_flag, dict) else ""
 
-            status_icon = "❌ 售罄" if is_sold else "✅ 有票"
+            if "未开售" in flag_name or (isinstance(sale_flag, dict) and sale_flag.get("number") == 1):
+                status_icon = "⏳ 未开售"
+            elif is_sold:
+                status_icon = "❌ 售罄"
+            else:
+                status_icon = "✅ 有票"
             price_str = f"¥{price/100:.0f}" if price else "?"
             extra = ""
             # num_type==1 时 num 才是真实库存，否则不显示
