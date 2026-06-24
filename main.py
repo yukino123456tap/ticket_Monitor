@@ -24,42 +24,51 @@ HEADERS = {
 
 # ---------- 工具 ----------
 
-def is_ticket_sold(t: dict) -> bool:
+def ticket_state(t: dict) -> str:
     """
-    综合判断票档是否已售罄/不可购。
-    sale_flag.number 含义：1=未开售, 2=预售中/在售, 4=已售罄
-    num_type: 0=限购值(非库存), 1=真实库存
+    返回票档状态字符串。
+    sale_flag.number 含义：
+      1=未开售, 2=预售中/在售, 4=已售罄, 5=不可售
     """
     sale_flag = t.get("sale_flag") or {}
     flag_num = sale_flag.get("number") if isinstance(sale_flag, dict) else None
     flag_name = sale_flag.get("display_name", "") if isinstance(sale_flag, dict) else ""
 
-    # 1) 未开售 → 不是售罄
+    # 明确的状态标记
     if flag_num == 1 or "未开售" in flag_name:
-        return False
-
-    # 2) 明确标记售罄
+        return "not_started"
     if flag_num == 4 or "已售罄" in flag_name:
-        return True
+        return "sold_out"
+    if flag_num == 5 or "不可售" in flag_name:
+        return "unsellable"
 
-    # 3) 其他明确的售罄标记
+    # is_sale == 0 表示不在售
+    if t.get("is_sale") == 0:
+        return "unsellable"
+
+    # 其他明确的售罄标记
     if t.get("is_sold_out", False):
-        return True
+        return "sold_out"
 
-    # 4) sale_status >= 2 通常表示不可购（2=售罄/下架，3+ 或其他结束态）
+    # sale_status >= 2 通常表示不可购
     if isinstance(t.get("sale_status"), int) and t["sale_status"] >= 2:
-        return True
+        return "sold_out"
 
-    # 5) 库存为 0（只当 num_type==1 时 num 才是真实库存）
+    # 库存为 0（只当 num_type==1 时 num 才是真实库存）
     if t.get("num_type") == 1:
         num = t.get("num")
         if num is not None and num <= 0:
-            return True
+            return "sold_out"
     stock = t.get("stock")
     if stock is not None and stock <= 0:
-        return True
+        return "sold_out"
 
-    return False
+    return "on_sale"
+
+
+def is_ticket_sold(t: dict) -> bool:
+    """是否售罄（向后兼容）"""
+    return ticket_state(t) == "sold_out"
 
 
 # ---------- 核心 API ----------
@@ -98,7 +107,7 @@ def extract_ticket_snapshot(data: dict) -> dict:
                 "num":        t.get("num") if t.get("num_type") == 1 else None,
                 "stock":      t.get("stock"),
                 "total":      t.get("total"),
-                "is_sold":    is_ticket_sold(t),
+                "state":      ticket_state(t),
                 "buy_limit":  t.get("buy_limit", ""),
             }
     return snapshot
@@ -151,19 +160,19 @@ def render_output(data: dict, project_id: int, last_update: str,
             key = (screen_name, ticket_id)
             desc = t.get("desc", "?")
             price = t.get("price", 0)
-            is_sold = is_ticket_sold(t)
+            state = ticket_state(t)
             stock = t.get("stock")
             num = t.get("num")
             num_type = t.get("num_type")        # 0=限购值, 1=真实库存
             total = t.get("total")
             buy_limit = t.get("buy_limit", "")
             static_limit = t.get("static_limit") or {}
-            sale_flag = t.get("sale_flag") or {}
-            flag_name = sale_flag.get("display_name", "") if isinstance(sale_flag, dict) else ""
 
-            if "未开售" in flag_name or (isinstance(sale_flag, dict) and sale_flag.get("number") == 1):
+            if state == "not_started":
                 status_icon = "⏳ 未开售"
-            elif is_sold:
+            elif state == "unsellable":
+                status_icon = "⛔ 不可售"
+            elif state == "sold_out":
                 status_icon = "❌ 售罄"
             else:
                 status_icon = "✅ 有票"
@@ -185,16 +194,18 @@ def render_output(data: dict, project_id: int, last_update: str,
 
             # 变更高亮
             if key in diffs:
-                # 如果是售罄→有票，用绿色；有票→售罄，用红色；库存变化用黄色
                 prev = prev_snapshot.get(key, {}) if prev_snapshot else {}
-                prev_sold = prev.get("is_sold", None)
+                prev_state = prev.get("state", "")
                 prev_stock = prev.get("num") if prev.get("num") is not None else prev.get("stock")
                 cur_stock = num if num is not None else stock
 
-                if prev_sold is True and not is_sold:
+                # 状态变化高亮
+                if prev_state == "sold_out" and state not in ("sold_out", "unsellable"):
                     line += "  \033[1;32m⬆ 已补票！\033[0m"
-                elif prev_sold is False and is_sold:
+                elif prev_state in ("on_sale", "not_started") and state == "sold_out":
                     line += "  \033[1;31m⬇ 已售罄\033[0m"
+                elif prev_state == "unsellable" and state == "on_sale":
+                    line += "  \033[1;32m⬆ 可售！\033[0m"
                 elif prev_stock is not None and cur_stock is not None and prev_stock != cur_stock:
                     delta = cur_stock - prev_stock
                     sign = "+" if delta > 0 else ""
@@ -241,7 +252,7 @@ def watch(project_id: int, interval: int):
                 old = prev_snapshot.get(k, {})
                 new = current.get(k, {})
                 if (
-                    old.get("is_sold") != new.get("is_sold") or
+                    old.get("state") != new.get("state") or
                     old.get("num") != new.get("num") or
                     old.get("stock") != new.get("stock") or
                     old.get("total") != new.get("total")
